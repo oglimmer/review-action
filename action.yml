@@ -1,0 +1,70 @@
+name: 'AI PR Review (OpenAI / Codex)'
+description: >-
+  Reviews a pull request with an OpenAI coding model (Codex lineage) and posts
+  inline review comments plus a summary. Works well for Vue, Java Spring Boot
+  and Go projects out of the box.
+author: 'oglimmer'
+branding:
+  icon: 'eye'
+  color: 'green'
+
+inputs:
+  openai-api-key:
+    description: 'OpenAI API key (store as a repo/org secret).'
+    required: true
+  github-token:
+    description: 'Token used to read the PR and post the review.'
+    required: false
+    default: ${{ github.token }}
+  model:
+    description: >-
+      OpenAI model to use. Any Responses-API coding model works, e.g.
+      gpt-5.5, gpt-5.4, gpt-5.3-codex, gpt-5.1-codex.
+    required: false
+    default: 'gpt-5.5'
+  reasoning-effort:
+    description: 'Reasoning effort passed to the model: low, medium or high.'
+    required: false
+    default: 'medium'
+  max-comments:
+    description: 'Maximum number of inline comments to post.'
+    required: false
+    default: '15'
+  max-files:
+    description: 'Maximum number of changed files to review.'
+    required: false
+    default: '50'
+  max-diff-chars:
+    description: 'Character budget for the diff sent to the model.'
+    required: false
+    default: '120000'
+  exclude:
+    description: >-
+      Comma-separated glob patterns to skip, added on top of built-in
+      defaults (lockfiles, dist/, vendor/, generated code, ...).
+    required: false
+    default: ''
+  extra-instructions:
+    description: 'Extra project-specific review instructions appended to the prompt.'
+    required: false
+    default: ''
+  request-changes-on:
+    description: >-
+      Submit the review as REQUEST_CHANGES when a finding of at least this
+      severity exists: critical, issue, or never.
+    required: false
+    default: 'never'
+  skip-draft:
+    description: 'Skip draft pull requests.'
+    required: false
+    default: 'true'
+
+outputs:
+  comment-count:
+    description: 'Number of inline comments posted.'
+  review-url:
+    description: 'URL of the posted review.'
+
+runs:
+  using: 'node20'
+  main: 'index.js'
