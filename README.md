@@ -30,6 +30,12 @@ permissions:
   contents: read
   pull-requests: write
 
+# Cancel an in-progress review when a newer push arrives, so overlapping runs
+# don't race to post reviews for stale commits.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -112,10 +118,15 @@ Then add your OpenAI API key as a repository (or organization) secret named
 - **Cost:** one API call per PR update; the diff is capped at
   `max-diff-chars` (~30k tokens by default). Use a smaller model and
   `reasoning-effort: low` for busy repos.
+- **Repeated pushes don't stack up.** The summary lives in a single sticky PR
+  comment that is edited in place on each push, and the previous run's inline
+  comments are deleted before the new ones are posted — so a PR with ten pushes
+  shows one current review, not ten. Inline threads a human has replied to are
+  preserved.
 - **Findings the model can't anchor** to a real diff line aren't dropped —
-  they're listed in a collapsible section of the review summary.
+  they're listed in a collapsible section of the sticky summary comment.
 - If posting inline comments fails (e.g. the branch moved mid-review), the
-  action falls back to a summary-only review containing all findings.
+  action folds all findings into the sticky summary comment instead.
 
 ## Development
 

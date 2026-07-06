@@ -2,7 +2,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { annotatePatch, buildExcluder, detectStacks, validateComments } = require('../index.js');
+const { annotatePatch, buildExcluder, detectStacks, validateComments, commentsToDelete } = require('../index.js');
+
+const MARKER = '<!-- openai-pr-review-comment -->';
 
 test('annotatePatch numbers added and context lines on the new side', () => {
   const patch = [
@@ -79,4 +81,20 @@ test('validateComments drops unanchored lines, dedupes, sorts by severity and ca
   const { valid, dropped } = validateComments(comments, fileIndex, 2);
   assert.deepStrictEqual(valid.map((c) => c.severity), ['critical', 'issue']);
   assert.strictEqual(dropped.length, 2);
+});
+
+test('commentsToDelete targets only our own comments, keeping human-answered threads', () => {
+  const comments = [
+    { id: 1, body: `finding A\n${MARKER}`, in_reply_to_id: null },       // ours, no replies -> delete
+    { id: 2, body: `finding B\n${MARKER}`, in_reply_to_id: null },       // ours, but a human replied -> keep
+    { id: 3, body: 'thanks, will fix', in_reply_to_id: 2 },              // human reply to #2
+    { id: 4, body: 'a human review comment', in_reply_to_id: null },     // not ours -> never touch
+    { id: 5, body: `finding C\n${MARKER}`, in_reply_to_id: 4 },          // ours, replying to a human -> delete
+  ];
+  assert.deepStrictEqual(commentsToDelete(comments, MARKER), [1, 5]);
+});
+
+test('commentsToDelete returns nothing when there are no prior bot comments', () => {
+  assert.deepStrictEqual(commentsToDelete([{ id: 1, body: 'human', in_reply_to_id: null }], MARKER), []);
+  assert.deepStrictEqual(commentsToDelete([], MARKER), []);
 });

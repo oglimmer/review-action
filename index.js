@@ -99,6 +99,62 @@ async function fetchChangedFiles(gh, repo, prNumber, maxFiles) {
   return files.slice(0, maxFiles);
 }
 
+// Hidden markers let a later run recognise what a previous run posted, so
+// repeated pushes update in place instead of stacking duplicates. Both render
+// invisibly in the GitHub UI.
+const REVIEW_MARKER = '<!-- openai-pr-review-action -->';
+const COMMENT_MARKER = '<!-- openai-pr-review-comment -->';
+
+async function fetchAllPages(gh, pathname) {
+  const out = [];
+  const sep = pathname.includes('?') ? '&' : '?';
+  for (let page = 1; ; page++) {
+    const batch = await gh(`${pathname}${sep}per_page=100&page=${page}`);
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    out.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return out;
+}
+
+// Picks the review comments a previous run left (they carry the marker) that are
+// safe to remove — i.e. not the root of a thread a human has since replied to.
+function commentsToDelete(comments, marker) {
+  const humanReplyTargets = new Set();
+  for (const c of comments) {
+    if (c.in_reply_to_id != null && !(c.body || '').includes(marker)) {
+      humanReplyTargets.add(c.in_reply_to_id);
+    }
+  }
+  return comments
+    .filter((c) => (c.body || '').includes(marker) && !humanReplyTargets.has(c.id))
+    .map((c) => c.id);
+}
+
+async function deletePreviousComments(gh, repo, prNumber) {
+  const comments = await fetchAllPages(gh, `/repos/${repo}/pulls/${prNumber}/comments`);
+  const ids = commentsToDelete(comments, COMMENT_MARKER);
+  for (const id of ids) {
+    try {
+      await gh(`/repos/${repo}/pulls/comments/${id}`, { method: 'DELETE' });
+    } catch (e) {
+      console.warn(`::warning::Could not delete stale review comment ${id}: ${e.message}`);
+    }
+  }
+  return ids.length;
+}
+
+// Creates the summary as a PR conversation comment, or edits the existing one in
+// place so there is only ever a single, current summary regardless of push count.
+async function upsertSummaryComment(gh, repo, prNumber, body) {
+  const existing = (await fetchAllPages(gh, `/repos/${repo}/issues/${prNumber}/comments`))
+    .find((c) => (c.body || '').includes(REVIEW_MARKER));
+  if (existing) {
+    return gh(`/repos/${repo}/issues/comments/${existing.id}`, { method: 'PATCH', body: { body } });
+  }
+  return gh(`/repos/${repo}/issues/${prNumber}/comments`, { method: 'POST', body: { body } });
+}
+
 // ---------------------------------------------------------------------------
 // Diff preparation
 // ---------------------------------------------------------------------------
@@ -311,7 +367,7 @@ function validateComments(comments, fileIndex, maxComments) {
 
 function buildReviewBody({ summary, model, dropped, skippedFiles, truncated }) {
   const parts = [
-    '<!-- openai-pr-review-action -->',
+    REVIEW_MARKER,
     `## 🤖 AI Code Review`,
     '',
     summary,
@@ -418,45 +474,56 @@ async function main() {
       ? 'REQUEST_CHANGES'
       : 'COMMENT';
 
-  const body = buildReviewBody({ summary: review.summary, model, dropped, skippedFiles, truncated });
-  const comments = valid.map((c) => ({
+  const summaryBody = buildReviewBody({ summary: review.summary, model, dropped, skippedFiles, truncated });
+  const inlineComments = valid.map((c) => ({
     path: c.path,
     line: c.line,
     side: 'RIGHT',
-    body: `${SEVERITY_BADGE[c.severity]} ${c.body}`,
+    body: `${SEVERITY_BADGE[c.severity]} ${c.body}\n\n${COMMENT_MARKER}`,
   }));
 
-  let posted;
-  try {
-    posted = await gh(`/repos/${repo}/pulls/${pr.number}/reviews`, {
-      method: 'POST',
-      body: { commit_id: pr.head.sha, event: reviewEvent, body, comments },
-    });
-  } catch (e) {
-    // Inline comments can 422 if the diff shifted since we read it; fall back
-    // to a summary-only review carrying the findings in the body.
-    console.warn(`::warning::Posting inline comments failed (${e.message}); posting summary-only review.`);
-    const fallback = `${body}\n\n### Findings\n${valid
-      .map((c) => `- ${SEVERITY_BADGE[c.severity]} \`${c.path}:${c.line}\` — ${c.body}`)
-      .join('\n')}`;
-    posted = await gh(`/repos/${repo}/pulls/${pr.number}/reviews`, {
-      method: 'POST',
-      body: { commit_id: pr.head.sha, event: reviewEvent, body: fallback },
-    });
+  // Every push triggers a fresh review. Remove the previous run's inline
+  // comments first so identical findings don't pile up push after push; threads
+  // a human has already replied to are left untouched.
+  const removed = await deletePreviousComments(gh, repo, pr.number);
+  if (removed) console.log(`Removed ${removed} stale inline comment(s) from a previous review.`);
+
+  let reviewUrl = '';
+  let summaryText = summaryBody;
+  if (inlineComments.length || reviewEvent === 'REQUEST_CHANGES') {
+    try {
+      const posted = await gh(`/repos/${repo}/pulls/${pr.number}/reviews`, {
+        method: 'POST',
+        body: { commit_id: pr.head.sha, event: reviewEvent, body: REVIEW_MARKER, comments: inlineComments },
+      });
+      reviewUrl = posted.html_url || '';
+    } catch (e) {
+      // Inline comments can 422 if the diff shifted since we read it; fold the
+      // findings into the sticky summary comment instead of losing them.
+      console.warn(`::warning::Posting inline comments failed (${e.message}); folding findings into the summary.`);
+      summaryText = `${summaryBody}\n\n### Findings\n${valid
+        .map((c) => `- ${SEVERITY_BADGE[c.severity]} \`${c.path}:${c.line}\` — ${c.body}`)
+        .join('\n')}`;
+    }
   }
 
-  setOutput('comment-count', String(comments.length));
-  setOutput('review-url', posted.html_url || '');
+  // The summary lives in one sticky PR comment that is edited in place on every
+  // push, so the conversation isn't flooded with a new summary per review.
+  const summaryComment = await upsertSummaryComment(gh, repo, pr.number, summaryText);
+  if (!reviewUrl) reviewUrl = summaryComment.html_url || '';
+
+  setOutput('comment-count', String(inlineComments.length));
+  setOutput('review-url', reviewUrl);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(
       process.env.GITHUB_STEP_SUMMARY,
-      `## AI Code Review\n${review.summary}\n\n${comments.length} inline comment(s) posted → ${posted.html_url}\n`
+      `## AI Code Review\n${review.summary}\n\n${inlineComments.length} inline comment(s) posted → ${reviewUrl}\n`
     );
   }
-  console.log(`Review posted: ${posted.html_url}`);
+  console.log(`Review posted: ${reviewUrl}`);
 }
 
-module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, REVIEW_SCHEMA };
+module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, commentsToDelete, REVIEW_SCHEMA };
 
 if (require.main === module) {
   main().catch((e) => fail(e.stack || String(e)));
