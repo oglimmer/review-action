@@ -2,9 +2,16 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { annotatePatch, buildExcluder, detectStacks, validateComments, commentsToDelete } = require('../index.js');
+const {
+  annotatePatch, buildExcluder, detectStacks, validateComments, commentsToDelete,
+  getIntInput, fetchWithRetry,
+} = require('../index.js');
 
 const MARKER = '<!-- openai-pr-review-comment -->';
+
+function fakeResponse(status) {
+  return { status, ok: status >= 200 && status < 300, headers: { get: () => null } };
+}
 
 test('annotatePatch numbers added and context lines on the new side', () => {
   const patch = [
@@ -97,4 +104,56 @@ test('commentsToDelete targets only our own comments, keeping human-answered thr
 test('commentsToDelete returns nothing when there are no prior bot comments', () => {
   assert.deepStrictEqual(commentsToDelete([{ id: 1, body: 'human', in_reply_to_id: null }], MARKER), []);
   assert.deepStrictEqual(commentsToDelete([], MARKER), []);
+});
+
+test('getIntInput falls back on missing, non-numeric and non-positive values', () => {
+  delete process.env.INPUT_THING;
+  assert.strictEqual(getIntInput('thing', 15), 15); // missing
+  process.env.INPUT_THING = 'abc';
+  assert.strictEqual(getIntInput('thing', 15), 15); // NaN
+  process.env.INPUT_THING = '0';
+  assert.strictEqual(getIntInput('thing', 15), 15); // not positive
+  process.env.INPUT_THING = '8';
+  assert.strictEqual(getIntInput('thing', 15), 8);  // valid
+  delete process.env.INPUT_THING;
+});
+
+test('fetchWithRetry retries transient failures then returns the success', async () => {
+  const statuses = [503, 429, 200];
+  let calls = 0;
+  const orig = global.fetch;
+  global.fetch = async () => fakeResponse(statuses[calls++]);
+  try {
+    const res = await fetchWithRetry('https://example.test', {}, { retries: 3, timeoutMs: 1000 });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(calls, 3);
+  } finally {
+    global.fetch = orig;
+  }
+});
+
+test('fetchWithRetry surfaces the last error after exhausting retries', async () => {
+  const orig = global.fetch;
+  global.fetch = async () => { throw new Error('network down'); };
+  try {
+    await assert.rejects(
+      fetchWithRetry('https://example.test', {}, { retries: 1, timeoutMs: 1000 }),
+      /network down/
+    );
+  } finally {
+    global.fetch = orig;
+  }
+});
+
+test('fetchWithRetry does not retry a 4xx client error', async () => {
+  let calls = 0;
+  const orig = global.fetch;
+  global.fetch = async () => { calls++; return fakeResponse(404); };
+  try {
+    const res = await fetchWithRetry('https://example.test', {}, { retries: 3, timeoutMs: 1000 });
+    assert.strictEqual(res.status, 404);
+    assert.strictEqual(calls, 1);
+  } finally {
+    global.fetch = orig;
+  }
 });

@@ -11,6 +11,14 @@ function getInput(name, fallback = '') {
   return v === undefined || v === '' ? fallback : v.trim();
 }
 
+// Like getInput but coerces to a positive integer, falling back to the default
+// when the value is missing or not a sane number (so a typo can't silently
+// disable comments or blow the diff budget).
+function getIntInput(name, fallback) {
+  const n = parseInt(getInput(name, String(fallback)), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
@@ -62,13 +70,55 @@ function buildExcluder(extraCsv) {
 }
 
 // ---------------------------------------------------------------------------
+// Networking (timeout + transient-failure retries)
+// ---------------------------------------------------------------------------
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// fetch with a per-attempt timeout and bounded retries on transient failures:
+// HTTP 429, any 5xx, and network/abort errors. Honours a Retry-After header when
+// present, otherwise backs off exponentially with jitter. A single hiccup from
+// GitHub or OpenAI no longer fails the whole review.
+async function fetchWithRetry(url, options = {}, { retries = 3, timeoutMs = 60000 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        const retryAfter = Number(res.headers.get('retry-after'));
+        const wait = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(8000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+        console.warn(`::warning::${url} -> ${res.status}; retrying in ${wait}ms (attempt ${attempt + 1}/${retries}).`);
+        await sleep(wait);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt >= retries) break;
+      const wait = Math.min(8000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+      console.warn(`::warning::${url} request failed (${e.message}); retrying in ${wait}ms (attempt ${attempt + 1}/${retries}).`);
+      await sleep(wait);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr || new Error(`Request to ${url} failed after ${retries} retries.`);
+}
+
+// ---------------------------------------------------------------------------
 // GitHub API
 // ---------------------------------------------------------------------------
 
 function makeGithubClient(token) {
   const base = process.env.GITHUB_API_URL || 'https://api.github.com';
   return async function gh(pathname, { method = 'GET', body } = {}) {
-    const res = await fetch(base + pathname, {
+    const res = await fetchWithRetry(base + pathname, {
       method,
       headers: {
         authorization: `Bearer ${token}`,
@@ -299,8 +349,8 @@ const REVIEW_SCHEMA = {
 // OpenAI Responses API
 // ---------------------------------------------------------------------------
 
-async function requestReview({ apiKey, model, reasoningEffort, instructions, input }) {
-  const res = await fetch('https://api.openai.com/v1/responses', {
+async function requestReview({ apiKey, model, reasoningEffort, maxOutputTokens, instructions, input }) {
+  const res = await fetchWithRetry('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -311,6 +361,7 @@ async function requestReview({ apiKey, model, reasoningEffort, instructions, inp
       instructions,
       input,
       reasoning: { effort: reasoningEffort },
+      max_output_tokens: maxOutputTokens,
       text: {
         format: {
           type: 'json_schema',
@@ -320,18 +371,28 @@ async function requestReview({ apiKey, model, reasoningEffort, instructions, inp
         },
       },
     }),
-  });
+  }, { timeoutMs: 300000 });
   const bodyText = await res.text();
   if (!res.ok) {
     throw new Error(`OpenAI API error ${res.status}: ${bodyText.slice(0, 1000)}`);
   }
   const data = JSON.parse(bodyText);
+  const message = (data.output || []).find((o) => o.type === 'message');
+  const textPart = message && (message.content || []).find((c) => c.type === 'output_text');
+  if (!textPart) {
+    // A hit output-token cap truncates the response before any parseable JSON is
+    // produced. Surface an actionable error rather than a raw JSON.parse crash.
+    if (data.status === 'incomplete') {
+      throw new Error(
+        `OpenAI response incomplete (${JSON.stringify(data.incomplete_details)}); ` +
+        'raise max-output-tokens or narrow the diff (max-diff-chars / exclude).'
+      );
+    }
+    throw new Error('OpenAI response contained no output text.');
+  }
   if (data.status === 'incomplete') {
     console.warn(`::warning::OpenAI response incomplete: ${JSON.stringify(data.incomplete_details)}`);
   }
-  const message = (data.output || []).find((o) => o.type === 'message');
-  const textPart = message && (message.content || []).find((c) => c.type === 'output_text');
-  if (!textPart) throw new Error('OpenAI response contained no output text.');
   return { review: JSON.parse(textPart.text), usage: data.usage };
 }
 
@@ -412,9 +473,10 @@ async function main() {
 
   const model = getInput('model', 'gpt-5.5');
   const reasoningEffort = getInput('reasoning-effort', 'medium');
-  const maxComments = parseInt(getInput('max-comments', '15'), 10);
-  const maxFiles = parseInt(getInput('max-files', '50'), 10);
-  const maxDiffChars = parseInt(getInput('max-diff-chars', '120000'), 10);
+  const maxComments = getIntInput('max-comments', 15);
+  const maxFiles = getIntInput('max-files', 50);
+  const maxDiffChars = getIntInput('max-diff-chars', 120000);
+  const maxOutputTokens = getIntInput('max-output-tokens', 16000);
   const requestChangesOn = getInput('request-changes-on', 'never');
 
   const repo = process.env.GITHUB_REPOSITORY;
@@ -461,7 +523,7 @@ async function main() {
     maxComments,
   });
 
-  const { review, usage } = await requestReview({ apiKey, model, reasoningEffort, instructions, input });
+  const { review, usage } = await requestReview({ apiKey, model, reasoningEffort, maxOutputTokens, instructions, input });
   if (usage) console.log(`Token usage: ${usage.input_tokens} in / ${usage.output_tokens} out`);
 
   const fileIndex = new Map(files.map((f) => [f.filename, f]));
@@ -523,7 +585,7 @@ async function main() {
   console.log(`Review posted: ${reviewUrl}`);
 }
 
-module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, commentsToDelete, REVIEW_SCHEMA };
+module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, commentsToDelete, getIntInput, fetchWithRetry, REVIEW_SCHEMA };
 
 if (require.main === module) {
   main().catch((e) => fail(e.stack || String(e)));

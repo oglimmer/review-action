@@ -38,6 +38,12 @@ inputs:
     description: 'Character budget for the diff sent to the model.'
     required: false
     default: '120000'
+  max-output-tokens:
+    description: >-
+      Maximum tokens the model may spend on the review (reasoning + output).
+      Raise it if reviews come back truncated on large PRs.
+    required: false
+    default: '16000'
   exclude:
     description: >-
       Comma-separated glob patterns to skip, added on top of built-in

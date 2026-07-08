@@ -59,6 +59,7 @@ Then add your OpenAI API key as a repository (or organization) secret named
 | `max-comments` | `15` | Cap on inline comments (most severe first). |
 | `max-files` | `50` | Cap on changed files reviewed. |
 | `max-diff-chars` | `120000` | Character budget for the diff sent to the model. |
+| `max-output-tokens` | `16000` | Token budget for the model's review (reasoning + output). Raise if reviews truncate on large PRs. |
 | `exclude` | `''` | Extra comma-separated globs to skip, e.g. `docs/**, **/*.sql`. |
 | `extra-instructions` | `''` | Project-specific review rules appended to the prompt. |
 | `request-changes-on` | `never` | Submit as `REQUEST_CHANGES` when a finding of at least this severity exists: `critical`, `issue`, or `never`. |
