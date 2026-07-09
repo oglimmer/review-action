@@ -194,6 +194,19 @@ async function deletePreviousComments(gh, repo, prNumber) {
   return ids.length;
 }
 
+// Returns the previous run's sticky summary body (markers stripped), or '' if
+// this is the first review. Feeds convergence: the model sees what it already
+// said so it stops re-raising resolved points or inventing fresh nits each push.
+async function fetchPriorReview(gh, repo, prNumber) {
+  const existing = (await fetchAllPages(gh, `/repos/${repo}/issues/${prNumber}/comments`))
+    .find((c) => (c.body || '').includes(REVIEW_MARKER));
+  if (!existing) return '';
+  return (existing.body || '')
+    .replace(/<!--[^]*?-->/g, '')          // strip hidden markers
+    .replace(/^\s*## 🤖 AI Code Review\s*/m, '')
+    .trim();
+}
+
 // Creates the summary as a PR conversation comment, or edits the existing one in
 // place so there is only ever a single, current summary regardless of push count.
 async function upsertSummaryComment(gh, repo, prNumber, body) {
@@ -274,7 +287,7 @@ function detectStacks(paths) {
   return STACK_RULES.filter((s) => paths.some((p) => s.match.test(p)));
 }
 
-function buildPrompt({ pr, files, stacks, extraInstructions, maxComments }) {
+function buildPrompt({ pr, files, stacks, extraInstructions, maxComments, priorReview }) {
   const stackSection = stacks.length
     ? stacks.map((s) => `${s.name}:\n${s.guidance.map((g) => `- ${g}`).join('\n')}`).join('\n\n')
     : 'No specific stack detected; apply general best practices.';
@@ -297,6 +310,23 @@ Do NOT:
 Severity levels: "critical" (must fix: bug/security), "issue" (should fix),
 "suggestion" (worth considering), "nit" (minor). Use "nit" sparingly.
 
+Decide an overall "verdict" for the PR. This gate decides whether the change
+can merge, so apply it strictly and consistently:
+- "request_changes" ONLY when the CURRENT diff contains a concrete blocking
+  defect you can point at: a bug or logic error introduced by the change, a
+  security vulnerability, a real regression, or data loss/corruption. A finding
+  must be "critical" or "issue" severity to justify it.
+- "approve" in every other case — including when only "suggestion"/"nit" items
+  remain. Approve is the default; request_changes is the exception you must
+  justify with a specific defect.
+- Design, architecture, and completeness PREFERENCES are NOT blocking. "I would
+  paginate instead of capping", "this could be more thorough", "consider
+  extracting a helper", "might want a test here" are "suggestion" or "nit" and
+  MUST NOT set request_changes. Do not withhold approval to push a rewrite.
+- Judge the code as-is against whether it is correct and safe to merge, not
+  against an ideal implementation. A reasonable, working solution that meets the
+  request is approvable even if you would have done it differently.
+
 Each comment must target a line marked with "+" (preferred) or an unchanged
 context line, using the line number printed in the diff (the new-file line
 number). Write comment bodies in GitHub markdown, concise, with a concrete
@@ -310,14 +340,26 @@ ${stackSection}${extraInstructions ? `\n\nProject-specific instructions (from th
     .map((f) => `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.annotated}\n\`\`\``)
     .join('\n\n');
 
-  const input = `Pull request #${pr.number}: ${pr.title}
+  // Convergence: a PR is re-reviewed on every push. Without the prior round's
+  // findings the model re-examines a cold diff each time and tends to surface a
+  // fresh nitpick per round (and even contradict itself — flag "unbounded", then
+  // flag the bound that fixed it), so a good PR can never reach approve. Feeding
+  // back what was already said lets it recognise addressed points and stop
+  // moving the goalposts.
+  const priorSection = priorReview
+    ? `\nThis PR was already reviewed on an EARLIER revision. Your previous review said:\n"""\n${priorReview.slice(0, 4000)}\n"""\nThe author has since pushed changes. Rules for this re-review:\n- If the current diff addresses a point you raised before, treat it as resolved — do not re-raise it or nitpick the fix you asked for.\n- Do NOT invent new non-blocking findings on code you already accepted just to keep requesting changes. Once the substantive issues from before are handled, approve.\n- Base your verdict solely on blocking defects present in the CURRENT diff.\n`
+    : '';
 
+  const input = `Pull request #${pr.number}: ${pr.title}
+${priorSection}
 ${pr.body ? `PR description:\n${pr.body.slice(0, 2000)}\n\n` : ''}Diff (each line is prefixed with marker and new-file line number):
 
 ${filesText}
 
-Return your review as JSON. "summary" is a short overall assessment in
-markdown (2-6 sentences: what the PR does, overall quality, main risks).`;
+Return your review as JSON: "verdict" ("approve" | "request_changes"),
+"summary" (a short overall assessment in markdown, 2-6 sentences: what the PR
+does, overall quality, and — if request_changes — the specific blocking defect),
+and "comments".`;
 
   return { instructions, input };
 }
@@ -326,6 +368,7 @@ const REVIEW_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
+    verdict: { type: 'string', enum: ['approve', 'request_changes'] },
     summary: { type: 'string' },
     comments: {
       type: 'array',
@@ -342,7 +385,7 @@ const REVIEW_SCHEMA = {
       },
     },
   },
-  required: ['summary', 'comments'],
+  required: ['verdict', 'summary', 'comments'],
 };
 
 // ---------------------------------------------------------------------------
@@ -426,10 +469,36 @@ function validateComments(comments, fileIndex, maxComments) {
   return { valid: valid.slice(0, maxComments), dropped };
 }
 
-function buildReviewBody({ summary, model, dropped, skippedFiles, truncated }) {
+// Maps the model's verdict (plus the optional severity-threshold override) to a
+// GitHub review event. The model's verdict is primary: "approve" -> APPROVE so
+// the PR carries a real APPROVED state a merge gate can act on; "request_changes"
+// -> REQUEST_CHANGES. `requestChangesOn` (critical|issue) is a stricter override
+// that can force REQUEST_CHANGES on severity even when the model would approve;
+// `approveWhenClean=false` reverts to comment-only (never auto-approve).
+function decideReviewEvent({ verdict, comments, requestChangesOn, approveWhenClean }) {
+  const threshold = SEVERITY_ORDER[requestChangesOn];
+  const hasBlocking = threshold !== undefined
+    && comments.some((c) => (SEVERITY_ORDER[c.severity] ?? 9) <= threshold);
+  if (verdict === 'request_changes' || hasBlocking) return 'REQUEST_CHANGES';
+  if (verdict === 'approve' && approveWhenClean) return 'APPROVE';
+  return 'COMMENT';
+}
+
+function buildReviewBody({ summary, model, dropped, skippedFiles, truncated, verdict, headSha, blockingCount }) {
+  // Machine-readable verdict line: a merge gate (e.g. the coding-agent worker)
+  // can read the verdict + reviewed SHA straight from the sticky comment without
+  // re-interpreting the prose, and confirm the review belongs to the current head.
+  const verdictMarker = `<!-- review-verdict:${verdict || 'unknown'} reviewed-sha:${headSha || ''} blocking:${blockingCount ?? 0} -->`;
+  const verdictBadge = verdict === 'approve'
+    ? '✅ **Approved** — no blocking issues found.'
+    : verdict === 'request_changes'
+      ? '🔴 **Changes requested** — see blocking findings below.'
+      : '';
   const parts = [
     REVIEW_MARKER,
+    verdictMarker,
     `## 🤖 AI Code Review`,
+    ...(verdictBadge ? ['', verdictBadge] : []),
     '',
     summary,
   ];
@@ -478,6 +547,7 @@ async function main() {
   const maxDiffChars = getIntInput('max-diff-chars', 120000);
   const maxOutputTokens = getIntInput('max-output-tokens', 16000);
   const requestChangesOn = getInput('request-changes-on', 'never');
+  const approveWhenClean = getInput('approve-when-clean', 'true') === 'true';
 
   const repo = process.env.GITHUB_REPOSITORY;
   const gh = makeGithubClient(token);
@@ -515,12 +585,22 @@ async function main() {
   const stacks = detectStacks(files.map((f) => f.filename));
   if (stacks.length) console.log(`Detected stacks: ${stacks.map((s) => s.name).join(', ')}`);
 
+  // Prior-round context (best-effort: a fetch failure just means a cold review).
+  let priorReview = '';
+  try {
+    priorReview = await fetchPriorReview(gh, repo, pr.number);
+    if (priorReview) console.log('Found a prior review; passing it in for convergence.');
+  } catch (e) {
+    console.warn(`::warning::Could not fetch prior review context: ${e.message}`);
+  }
+
   const { instructions, input } = buildPrompt({
     pr,
     files,
     stacks,
     extraInstructions: getInput('extra-instructions'),
     maxComments,
+    priorReview,
   });
 
   const { review, usage } = await requestReview({ apiKey, model, reasoningEffort, maxOutputTokens, instructions, input });
@@ -530,13 +610,15 @@ async function main() {
   const { valid, dropped } = validateComments(review.comments, fileIndex, maxComments);
   console.log(`Model returned ${(review.comments || []).length} comment(s); posting ${valid.length}, unanchored ${dropped.length}.`);
 
-  const threshold = SEVERITY_ORDER[requestChangesOn];
-  const reviewEvent =
-    threshold !== undefined && valid.some((c) => SEVERITY_ORDER[c.severity] <= threshold)
-      ? 'REQUEST_CHANGES'
-      : 'COMMENT';
+  const verdict = review.verdict === 'request_changes' ? 'request_changes' : 'approve';
+  const blockingCount = valid.filter((c) => (SEVERITY_ORDER[c.severity] ?? 9) <= SEVERITY_ORDER.issue).length;
+  const reviewEvent = decideReviewEvent({ verdict, comments: valid, requestChangesOn, approveWhenClean });
+  console.log(`Verdict: ${verdict} (${blockingCount} blocking finding(s)) -> ${reviewEvent}`);
 
-  const summaryBody = buildReviewBody({ summary: review.summary, model, dropped, skippedFiles, truncated });
+  const summaryBody = buildReviewBody({
+    summary: review.summary, model, dropped, skippedFiles, truncated,
+    verdict, headSha: pr.head.sha, blockingCount,
+  });
   const inlineComments = valid.map((c) => ({
     path: c.path,
     line: c.line,
@@ -550,13 +632,23 @@ async function main() {
   const removed = await deletePreviousComments(gh, repo, pr.number);
   if (removed) console.log(`Removed ${removed} stale inline comment(s) from a previous review.`);
 
+  // Submit a formal review whenever there is a verdict to record (APPROVE /
+  // REQUEST_CHANGES) or inline comments to post. A COMMENT event with no comments
+  // carries no signal, so we skip it and just refresh the sticky summary. Emitting
+  // a real APPROVED/CHANGES_REQUESTED state is what lets an automated merge gate
+  // act on the review deterministically instead of parsing prose.
+  const reviewBody = `${REVIEW_MARKER}\n${
+    verdict === 'approve'
+      ? '✅ Approved by AI review — no blocking issues found.'
+      : '🔴 Changes requested by AI review — see the blocking findings.'
+  }`;
   let reviewUrl = '';
   let summaryText = summaryBody;
-  if (inlineComments.length || reviewEvent === 'REQUEST_CHANGES') {
+  if (reviewEvent !== 'COMMENT' || inlineComments.length) {
     try {
       const posted = await gh(`/repos/${repo}/pulls/${pr.number}/reviews`, {
         method: 'POST',
-        body: { commit_id: pr.head.sha, event: reviewEvent, body: REVIEW_MARKER, comments: inlineComments },
+        body: { commit_id: pr.head.sha, event: reviewEvent, body: reviewBody, comments: inlineComments },
       });
       reviewUrl = posted.html_url || '';
     } catch (e) {
@@ -576,6 +668,8 @@ async function main() {
 
   setOutput('comment-count', String(inlineComments.length));
   setOutput('review-url', reviewUrl);
+  setOutput('verdict', verdict);
+  setOutput('blocking-count', String(blockingCount));
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(
       process.env.GITHUB_STEP_SUMMARY,
@@ -585,7 +679,7 @@ async function main() {
   console.log(`Review posted: ${reviewUrl}`);
 }
 
-module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, commentsToDelete, getIntInput, fetchWithRetry, REVIEW_SCHEMA };
+module.exports = { annotatePatch, globToRegex, buildExcluder, detectStacks, validateComments, commentsToDelete, getIntInput, fetchWithRetry, decideReviewEvent, REVIEW_SCHEMA };
 
 if (require.main === module) {
   main().catch((e) => fail(e.stack || String(e)));

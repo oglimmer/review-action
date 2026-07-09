@@ -12,6 +12,13 @@ A GitHub Action that reviews pull requests with an OpenAI coding model
 - Uses the OpenAI Responses API with strict JSON-schema output, then
   validates every comment against real diff lines before posting — no
   comments on lines that don't exist.
+- Emits an explicit **verdict** (`approve` / `request_changes`) and submits a
+  real `APPROVE` / `REQUEST_CHANGES` review, so an automated merge gate can act
+  on it. Only concrete blocking defects (bugs, security, regressions) block;
+  design/style preferences stay non-blocking.
+- **Converges across pushes.** Each re-review is fed the previous round's
+  findings, so it stops re-raising resolved points or inventing a fresh nitpick
+  every push — a good PR actually reaches `approve`.
 - Skips lockfiles, `dist/`, `target/`, `vendor/`, generated code, binaries.
 
 ## Usage
@@ -62,7 +69,8 @@ Then add your OpenAI API key as a repository (or organization) secret named
 | `max-output-tokens` | `16000` | Token budget for the model's review (reasoning + output). Raise if reviews truncate on large PRs. |
 | `exclude` | `''` | Extra comma-separated globs to skip, e.g. `docs/**, **/*.sql`. |
 | `extra-instructions` | `''` | Project-specific review rules appended to the prompt. |
-| `request-changes-on` | `never` | Submit as `REQUEST_CHANGES` when a finding of at least this severity exists: `critical`, `issue`, or `never`. |
+| `request-changes-on` | `never` | Stricter override: force `REQUEST_CHANGES` when a finding of at least this severity exists (`critical`, `issue`), on top of the model's verdict. `never` leaves the verdict in charge. |
+| `approve-when-clean` | `true` | Submit a real `APPROVE` review when the verdict is `approve`. Set `false` to only ever post comments (never auto-approve). |
 | `skip-draft` | `true` | Skip draft PRs. |
 
 ## Outputs
@@ -71,6 +79,33 @@ Then add your OpenAI API key as a repository (or organization) secret named
 |---|---|
 | `comment-count` | Number of inline comments posted. |
 | `review-url` | URL of the posted review. |
+| `verdict` | Overall verdict: `approve` or `request_changes`. |
+| `blocking-count` | Number of blocking (critical/issue) findings. |
+
+## Verdict, auto-approve & convergence
+
+The model returns an overall **verdict** alongside its comments, and the action
+submits it as a real GitHub review:
+
+- **`approve` → `APPROVE`** (when `approve-when-clean` is true, the default).
+  The verdict is `approve` unless there is a concrete blocking defect in the
+  diff — a bug/logic error, a security hole, a real regression, or data loss.
+  Design, architecture and completeness *preferences* (“I’d paginate instead of
+  capping”, “could be more thorough”) are `suggestion`/`nit` and never block.
+- **`request_changes` → `REQUEST_CHANGES`**, reserved for those blocking defects.
+
+**Convergence.** A PR is re-reviewed on every push. The action feeds the
+previous round’s summary back into the prompt and instructs the model to treat
+addressed points as resolved and not to invent new non-blocking nits — so an
+iterating author (human or an automated coding agent) can actually reach
+`approve` instead of chasing a moving target.
+
+**Machine-readable marker.** The sticky summary comment carries a hidden line
+for merge gates that don’t want to rely on GitHub’s review state:
+
+```
+<!-- review-verdict:approve reviewed-sha:<head-sha> blocking:0 -->
+```
 
 ## Per-project tuning examples
 

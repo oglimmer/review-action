@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   annotatePatch, buildExcluder, detectStacks, validateComments, commentsToDelete,
-  getIntInput, fetchWithRetry,
+  getIntInput, fetchWithRetry, decideReviewEvent, REVIEW_SCHEMA,
 } = require('../index.js');
 
 const MARKER = '<!-- openai-pr-review-comment -->';
@@ -156,4 +156,54 @@ test('fetchWithRetry does not retry a 4xx client error', async () => {
   } finally {
     global.fetch = orig;
   }
+});
+
+// --- verdict-driven review event ---------------------------------------------
+
+test('REVIEW_SCHEMA requires a verdict enum', () => {
+  assert.ok(REVIEW_SCHEMA.required.includes('verdict'));
+  assert.deepStrictEqual(REVIEW_SCHEMA.properties.verdict.enum, ['approve', 'request_changes']);
+});
+
+test('decideReviewEvent: approve verdict -> APPROVE (auto-approve on by default)', () => {
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'approve', comments: [{ severity: 'nit' }, { severity: 'suggestion' }], requestChangesOn: 'never', approveWhenClean: true }),
+    'APPROVE'
+  );
+});
+
+test('decideReviewEvent: nits/suggestions do NOT block approval', () => {
+  // The 500-cap style design preference is a suggestion; it must not flip to REQUEST_CHANGES.
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'approve', comments: [{ severity: 'suggestion' }], requestChangesOn: 'never', approveWhenClean: true }),
+    'APPROVE'
+  );
+});
+
+test('decideReviewEvent: request_changes verdict -> REQUEST_CHANGES', () => {
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'request_changes', comments: [{ severity: 'issue' }], requestChangesOn: 'never', approveWhenClean: true }),
+    'REQUEST_CHANGES'
+  );
+});
+
+test('decideReviewEvent: request-changes-on=issue forces REQUEST_CHANGES even when model approves', () => {
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'approve', comments: [{ severity: 'issue' }], requestChangesOn: 'issue', approveWhenClean: true }),
+    'REQUEST_CHANGES'
+  );
+});
+
+test('decideReviewEvent: request-changes-on=critical ignores a mere issue', () => {
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'approve', comments: [{ severity: 'issue' }], requestChangesOn: 'critical', approveWhenClean: true }),
+    'APPROVE'
+  );
+});
+
+test('decideReviewEvent: approve-when-clean=false reverts to comment-only', () => {
+  assert.strictEqual(
+    decideReviewEvent({ verdict: 'approve', comments: [], requestChangesOn: 'never', approveWhenClean: false }),
+    'COMMENT'
+  );
 });

@@ -56,10 +56,19 @@ inputs:
     default: ''
   request-changes-on:
     description: >-
-      Submit the review as REQUEST_CHANGES when a finding of at least this
-      severity exists: critical, issue, or never.
+      Force REQUEST_CHANGES when a finding of at least this severity exists,
+      even if the model's verdict is approve: critical, issue, or never. A
+      stricter override on top of the model's verdict (which already requests
+      changes on real blocking defects).
     required: false
     default: 'never'
+  approve-when-clean:
+    description: >-
+      When true (default), submit a real APPROVE review when the model's verdict
+      is "approve" (no blocking defects) so an automated merge gate can act on
+      it. Set to false to never auto-approve and only ever post comments.
+    required: false
+    default: 'true'
   skip-draft:
     description: 'Skip draft pull requests.'
     required: false
@@ -70,6 +79,10 @@ outputs:
     description: 'Number of inline comments posted.'
   review-url:
     description: 'URL of the posted review.'
+  verdict:
+    description: 'Overall verdict: approve | request_changes.'
+  blocking-count:
+    description: 'Number of blocking (critical/issue) findings.'
 
 runs:
   using: 'node20'
